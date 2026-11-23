@@ -28,13 +28,38 @@ import time
 import argparse
 import threading
 import webbrowser
+import mimetypes
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "input_data")) if not os.path.exists("input_data") else os.path.abspath("input_data")
 REPORTS_DIR = os.path.join(BASE_DIR, "reports")
+FRONTEND_DIST = os.path.abspath(os.path.join(BASE_DIR, "..", "frontend", "dist"))
+BLOGS_FILE = os.path.join(REPORTS_DIR, "blogs.json")
+
+def load_blogs() -> List[Dict[str, Any]]:
+    if os.path.exists(BLOGS_FILE):
+        try:
+            with open(BLOGS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return []
+
+def save_blog(post: Dict[str, Any]) -> List[Dict[str, Any]]:
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    blogs = load_blogs()
+    # Check if slug exists, replace or append
+    existing_idx = next((i for i, b in enumerate(blogs) if b.get("slug") == post.get("slug") or b.get("id") == post.get("id")), None)
+    if existing_idx is not None:
+        blogs[existing_idx] = post
+    else:
+        blogs.insert(0, post)
+    with open(BLOGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(blogs, f, indent=2)
+    return blogs
 
 from fatigue_pipeline import FatiguePipeline
 from api_downloader import fetch_and_extract_rawdata, validate_user_id, validate_dates
@@ -245,10 +270,37 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(info).encode("utf-8"))
             return
 
+        if path == "/api/blogs":
+            blogs = load_blogs()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_security_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(blogs).encode("utf-8"))
+            return
+
+        if path.startswith("/api/blogs/"):
+            slug = path[len("/api/blogs/"):]
+            blogs = load_blogs()
+            post = next((b for b in blogs if b.get("slug") == slug or b.get("id") == slug), None)
+            if post:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps(post).encode("utf-8"))
+            else:
+                self.send_response(404)
+                self.send_security_headers()
+                self.end_headers()
+            return
+
         if path == "/api/data":
             reports = {}
             if os.path.exists(REPORTS_DIR):
                 for p in sorted(glob.glob(os.path.join(REPORTS_DIR, "*.json"))):
+                    if os.path.basename(p) == "blogs.json":
+                        continue
                     try:
                         with open(p, "r", encoding="utf-8") as rf:
                             data = json.load(rf)
@@ -264,6 +316,45 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(payload.encode("utf-8"))
             return
 
+        # Static assets or React SPA Routing
+        if os.path.exists(FRONTEND_DIST):
+            # Check for direct static file in dist
+            rel_path = path.lstrip("/")
+            file_path = os.path.join(FRONTEND_DIST, rel_path) if rel_path else None
+            if file_path and os.path.isfile(file_path):
+                mime, _ = mimetypes.guess_type(file_path)
+                if not mime:
+                    if file_path.endswith(".js"):
+                        mime = "text/javascript"
+                    elif file_path.endswith(".css"):
+                        mime = "text/css"
+                    else:
+                        mime = "application/octet-stream"
+                with open(file_path, "rb") as f:
+                    content = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(content)))
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(content)
+                return
+
+            # Client-side SPA routes fallback to index.html (e.g. /, /blog, /blog/new, /blog/...)
+            if not path.startswith("/api/"):
+                index_html = os.path.join(FRONTEND_DIST, "index.html")
+                if os.path.isfile(index_html):
+                    with open(index_html, "rb") as f:
+                        content = f.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.send_security_headers()
+                    self.end_headers()
+                    self.wfile.write(content)
+                    return
+
+        # Fallback to legacy dashboard.html if frontend dist isn't available
         if path in ("/", "/index.html", "/dashboard.html"):
             dash_path = os.path.join(BASE_DIR, "dashboard.html")
             if not os.path.exists(dash_path):
@@ -282,6 +373,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        if self.path == "/api/blogs":
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                post_data = json.loads(raw.decode("utf-8"))
+                saved_blogs = save_blog(post_data)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "saved", "blog": post_data}).encode("utf-8"))
+            except Exception as e:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode("utf-8"))
+            return
         if self.path == "/api/run":
             with job_lock:
                 if job_state["state"] == "running":
