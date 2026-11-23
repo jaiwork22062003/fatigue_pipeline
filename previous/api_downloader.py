@@ -11,9 +11,11 @@ Handles:
 import os
 import re
 import time
+import json
 import zipfile
 import datetime
 import html
+import ssl
 import tempfile
 import urllib.request
 import urllib.parse
@@ -21,6 +23,12 @@ import urllib.error
 from typing import Dict, Any, List, Optional, Callable, Tuple
 
 BASE_API_URL = "https://florina.ownwearable.com/pyapi/v1/rawdata/txt-zip-export/download"
+
+# Resilient SSL Context
+try:
+    SSL_CONTEXT = ssl.create_default_context()
+except Exception:
+    SSL_CONTEXT = ssl._create_unverified_context()
 
 def validate_user_id(user_id: Optional[str]) -> str:
     """Validates user ID format and length to prevent malformed or injection inputs."""
@@ -51,11 +59,25 @@ def validate_dates(start_date: str, end_date: str) -> None:
     if diff_days > 90:
         raise ValueError(f"Selected range is {diff_days} days. API allows at most 90 days.")
 
-def extract_api_error(html_text: str) -> Optional[str]:
-    """Detects explicit export failure message from HTML response (e.g. no raw data found)."""
-    unescaped = html.unescape(html_text)
+def extract_api_error(response_text: str) -> Optional[str]:
+    """Detects explicit export failure message from HTML or JSON response (e.g. no raw data found)."""
+    if not response_text:
+        return None
+
+    # Try parsing JSON response
+    stripped = response_text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            d = json.loads(stripped)
+            if "error" in d and d["error"]:
+                return str(d["error"])
+            if d.get("status") in ["error", "failed"] and "message" in d:
+                return str(d["message"])
+        except Exception:
+            pass
+
+    unescaped = html.unescape(response_text)
     if "The export could not be prepared" in unescaped or "No raw data found" in unescaped:
-        # Extract specific descriptive reason from paragraph
         m = re.search(r'<p>[^<]*?(?:100%\s*&middot;\s*)?(No raw data found[^<]*)', unescaped, re.I)
         if m:
             return m.group(1).strip()
@@ -73,26 +95,40 @@ def extract_api_error(html_text: str) -> Optional[str]:
 
     return None
 
-def extract_s3_url(html_text: str) -> Optional[str]:
-    """Finds presigned S3 ZIP download URL from HTML response."""
-    unescaped = html.unescape(html_text)
+def extract_s3_url(response_text: str) -> Optional[str]:
+    """Finds presigned S3 ZIP download URL from HTML or JSON response."""
+    if not response_text:
+        return None
+
+    # Try JSON response first
+    stripped = response_text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            d = json.loads(stripped)
+            for k in ["s3_url", "download_url", "url", "s3_download_url"]:
+                if k in d and isinstance(d[k], str) and ("s3.amazonaws.com" in d[k] or ".zip" in d[k]):
+                    return html.unescape(d[k].strip())
+        except Exception:
+            pass
+
+    unescaped = html.unescape(response_text)
 
     # Check for meta refresh URL with s3
     m = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*content=["\']\s*\d+\s*;\s*url=([^"\'>]+)["\']', unescaped, re.I)
     if m:
-        candidate = m.group(1).strip()
+        candidate = html.unescape(m.group(1).strip())
         if "s3.amazonaws.com" in candidate or candidate.endswith(".zip") or ".zip?" in candidate:
             return candidate
 
     # Check for <a class="btn" href="..."> or any href with .zip or s3
     m = re.search(r'<a[^>]+href=["\']([^"\']*(?:s3\.amazonaws\.com|\.zip)[^"\']*)["\']', unescaped, re.I)
     if m:
-        return m.group(1).strip()
+        return html.unescape(m.group(1).strip())
 
     # Generic regex for S3 presigned URL
-    m = re.search(r'(https://florina-prod-rawdata\.s3\.amazonaws\.com/[^\s"\'<>]+)', unescaped)
+    m = re.search(r'(https://[a-zA-Z0-9.-]*s3[a-zA-Z0-9.-]*\.amazonaws\.com/[^\s"\'<>]+)', unescaped)
     if m:
-        return m.group(1).strip()
+        return html.unescape(m.group(1).strip())
 
     return None
 
@@ -201,7 +237,7 @@ def fetch_and_extract_rawdata(
         req = urllib.request.Request(next_request_url, headers=headers)
         current_sleep = poll_interval
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=25, context=SSL_CONTEXT) as resp:
                 content_type = resp.headers.get("Content-Type", "")
 
                 # Check if response is directly a ZIP file stream
@@ -288,7 +324,7 @@ def fetch_and_extract_rawdata(
         })
 
     s3_req = urllib.request.Request(s3_download_url, headers=headers)
-    with urllib.request.urlopen(s3_req, timeout=90) as s3_resp:
+    with urllib.request.urlopen(s3_req, timeout=90, context=SSL_CONTEXT) as s3_resp:
         return _stream_and_extract_zip(s3_resp, output_dir, progress_callback)
 
 

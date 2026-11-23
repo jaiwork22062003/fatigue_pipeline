@@ -6,8 +6,24 @@ Runs on localhost:8001. Restricts execution ONLY to the Current Pipeline.
 
 import os
 import sys
+
+# Auto-detect Python runtime with numpy/scipy if launched under bare python3
+try:
+    import numpy
+    import scipy
+except ImportError:
+    candidates = [
+        os.path.expanduser("~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python3")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "Scripts", "python.exe")),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and c != sys.executable:
+            os.execv(c, [c] + sys.argv)
+
 import glob
 import json
+import re
 import time
 import argparse
 import threading
@@ -27,6 +43,62 @@ import build_dashboard
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8001
 ALLOWED_HOSTNAMES = {"localhost", "127.0.0.1", "[::1]"}
+
+def get_users_and_dates() -> Dict[str, Any]:
+    """
+    Scans input_data/ and reports/ to extract all known users and their available dates.
+    Returns list of users and a dictionary of available dates per user.
+    """
+    user_dates: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    known_users = set(["3mSa_i"])
+    pattern = re.compile(r'^([A-Za-z0-9_]+)_rawdata_(\d{4}-\d{2}-\d{2})')
+
+    # 1. Scan input_data/
+    if os.path.exists(DATA_DIR):
+        for fname in sorted(os.listdir(DATA_DIR)):
+            fpath = os.path.join(DATA_DIR, fname)
+            if not os.path.isfile(fpath):
+                continue
+            m = pattern.match(fname)
+            if m:
+                uid, dt = m.group(1), m.group(2)
+                known_users.add(uid)
+                if uid not in user_dates:
+                    user_dates[uid] = {}
+                if dt not in user_dates[uid]:
+                    user_dates[uid][dt] = {"files": [], "has_report": False, "count": 0, "total_size_mb": 0.0}
+                user_dates[uid][dt]["files"].append(fname)
+                user_dates[uid][dt]["count"] += 1
+                try:
+                    user_dates[uid][dt]["total_size_mb"] = round(user_dates[uid][dt]["total_size_mb"] + os.path.getsize(fpath) / (1024 * 1024), 2)
+                except Exception:
+                    pass
+
+    # 2. Scan REPORTS_DIR
+    if os.path.exists(REPORTS_DIR):
+        for rname in sorted(os.listdir(REPORTS_DIR)):
+            if not rname.endswith(".json"):
+                continue
+            rpath = os.path.join(REPORTS_DIR, rname)
+            m = pattern.match(rname)
+            if m:
+                uid, dt = m.group(1), m.group(2)
+                known_users.add(uid)
+                if uid not in user_dates:
+                    user_dates[uid] = {}
+                if dt not in user_dates[uid]:
+                    user_dates[uid][dt] = {"files": [], "has_report": True, "count": 1, "total_size_mb": 0.0}
+                else:
+                    user_dates[uid][dt]["has_report"] = True
+
+    for u in known_users:
+        if u not in user_dates:
+            user_dates[u] = {}
+
+    return {
+        "users": sorted(list(known_users)),
+        "user_dates": user_dates
+    }
 
 job_state = {
     "state": "idle",
@@ -59,13 +131,26 @@ def run_job_thread(params: Dict[str, Any]):
                 job_state["percent"] = min(50, int(orig_pct * 0.5))
                 job_state["message"] = info.get("message", "Downloading telemetry...")
 
-        extracted = fetch_and_extract_rawdata(
-            user_id=user_id,
-            start_date=start_date,
-            end_date=end_date,
-            output_dir=DATA_DIR,
-            progress_callback=dl_cb
-        )
+        matching_local = []
+        if os.path.exists(DATA_DIR) and not params.get("force_download", False):
+            for fn in sorted(os.listdir(DATA_DIR)):
+                if fn.startswith(f"{user_id}_rawdata_{start_date}") and (fn.endswith(".txt") or fn.endswith(".jsonl")):
+                    matching_local.append(os.path.join(DATA_DIR, fn))
+
+        if matching_local:
+            extracted = matching_local
+            with job_lock:
+                job_state["percent"] = 50
+                job_state["phase"] = "evaluating"
+                job_state["message"] = f"Found {len(extracted)} telemetry file(s) locally. Evaluating Current Pipeline..."
+        else:
+            extracted = fetch_and_extract_rawdata(
+                user_id=user_id,
+                start_date=start_date,
+                end_date=end_date,
+                output_dir=DATA_DIR,
+                progress_callback=dl_cb
+            )
 
         if not extracted:
             raise RuntimeError(f"No telemetry data found for user {user_id}.")
@@ -134,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_security_headers()
         self.end_headers()
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -146,6 +234,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_security_headers()
             self.end_headers()
             self.wfile.write(d.encode("utf-8"))
+            return
+
+        if path == "/api/users-and-dates":
+            info = get_users_and_dates()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_security_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(info).encode("utf-8"))
             return
 
         if path == "/api/data":
@@ -197,7 +294,23 @@ class Handler(BaseHTTPRequestHandler):
 
             length = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(length)
-            params = json.loads(raw.decode("utf-8"))
+            try:
+                params = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Invalid JSON request payload."}).encode("utf-8"))
+                return
+
+            if not params.get("start_date"):
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_security_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Start date is required."}).encode("utf-8"))
+                return
 
             t = threading.Thread(target=run_job_thread, args=(params,), daemon=True)
             t.start()
@@ -214,7 +327,17 @@ def start_server(host=DEFAULT_HOST, port=DEFAULT_PORT, open_browser=True):
     if not os.path.exists(os.path.join(BASE_DIR, "dashboard.html")):
         build_dashboard.update_dashboard()
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as oe:
+        if oe.errno == 98 or getattr(oe, "winerror", None) == 10048:
+            print(f"[!] Port {port} is already bound on {host}.")
+            print(f"[*] Connecting to existing running dashboard server at: http://{host}:{port}")
+            if open_browser:
+                webbrowser.open(f"http://{host}:{port}")
+            return
+        raise
+
     url = f"http://{host}:{port}"
     print("=" * 72)
     print("   OWN SENSE - CURRENT PRODUCTION PIPELINE SERVER")

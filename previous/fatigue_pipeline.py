@@ -59,11 +59,10 @@ class PreviousFatiguePipeline:
     def parse_records(self, file_path: str, max_lines: Optional[int] = None) -> Tuple[List[Tuple], List[Tuple]]:
         """
         Parses raw JSONL data into chronologically sorted PPG and IMU time-series chunks.
+        Uses two-pass global timestamp normalization to ensure immunity to out-of-order initial packets.
         """
-        ppg_samples = []  # (timestamp_sec, ir_val, rd_val)
-        imu_samples = []  # (timestamp_sec, ax, ay, az, gx, gy, gz, foot)
-
-        start_time = None
+        raw_ppg: List[Tuple[float, float, float]] = []
+        raw_imu: List[Tuple[float, float, float, float, float, float, float, str]] = []
 
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for idx, line in enumerate(f):
@@ -79,26 +78,38 @@ class PreviousFatiguePipeline:
 
                 topic = record.get("topic", "")
                 content = record.get("content", {})
+                if isinstance(content, str):
+                    try:
+                        content = json.loads(content)
+                    except Exception:
+                        content = {}
+
                 t_type = content.get("T", "")
 
-                # Extract timestamp
-                ts_str = content.get("timestamp")
-                if not ts_str and "Data" in content and isinstance(content["Data"], dict):
-                    ts_str = content["Data"].get("timestamp")
+                # Extract timestamp (handles ISO string or numeric epoch)
+                ts_val = content.get("timestamp")
+                if not ts_val and "Data" in content and isinstance(content["Data"], dict):
+                    ts_val = content["Data"].get("timestamp")
 
-                if not ts_str:
+                if not ts_val:
                     continue
 
-                try:
-                    dt = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    t_sec = dt.timestamp()
-                except Exception:
+                t_sec = None
+                if isinstance(ts_val, (int, float)):
+                    t_sec = float(ts_val) / 1000.0 if ts_val > 1e11 else float(ts_val)
+                elif isinstance(ts_val, str):
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+                        t_sec = dt.timestamp()
+                    except Exception:
+                        try:
+                            f_val = float(ts_val)
+                            t_sec = f_val / 1000.0 if f_val > 1e11 else f_val
+                        except Exception:
+                            continue
+
+                if t_sec is None:
                     continue
-
-                if start_time is None:
-                    start_time = t_sec
-
-                rel_t = max(0.0, t_sec - start_time)
 
                 # Parse PPG
                 if t_type == "PG" or (topic == "PPG" and "IR" in content):
@@ -106,9 +117,14 @@ class PreviousFatiguePipeline:
                     rd_arr = content.get("RD", [])
                     n = min(len(ir_arr), len(rd_arr))
                     if n > 0:
-                        packet_dt = 0.01  # ~100 Hz equivalent
+                        packet_dt = 0.04  # 25 Hz nominal sample interval
                         for j in range(n):
-                            ppg_samples.append((rel_t + j * packet_dt, float(ir_arr[j]), float(rd_arr[j])))
+                            try:
+                                ir_v = float(ir_arr[j])
+                                rd_v = float(rd_arr[j])
+                                raw_ppg.append((t_sec + j * packet_dt, ir_v, rd_v))
+                            except (ValueError, TypeError, IndexError):
+                                continue
 
                 # Parse Left Foot / Board IMU
                 elif t_type == "BL" or (topic == "PPG" and "AC" in content):
@@ -116,10 +132,13 @@ class PreviousFatiguePipeline:
                     gy = content.get("GY", [])
                     n_triplets = min(len(ac) // 3, len(gy) // 3)
                     for j in range(n_triplets):
-                        t_sub = rel_t + j * 0.01
-                        ax, ay, az = ac[j*3], ac[j*3+1], ac[j*3+2]
-                        gx, gy_val, gz = gy[j*3], gy[j*3+1], gy[j*3+2]
-                        imu_samples.append((t_sub, ax, ay, az, gx, gy_val, gz, "left"))
+                        try:
+                            t_sub = t_sec + j * 0.01
+                            ax, ay, az = float(ac[j*3]), float(ac[j*3+1]), float(ac[j*3+2])
+                            gx, gy_val, gz = float(gy[j*3]), float(gy[j*3+1]), float(gy[j*3+2])
+                            raw_imu.append((t_sub, ax, ay, az, gx, gy_val, gz, "left"))
+                        except (ValueError, TypeError, IndexError):
+                            continue
 
                 # Parse Right Foot IMU
                 elif t_type == "BR" or topic == "BPST_RIGHT":
@@ -128,10 +147,23 @@ class PreviousFatiguePipeline:
                     gy = data.get("GY", [])
                     n_triplets = min(len(ac) // 3, len(gy) // 3)
                     for j in range(n_triplets):
-                        t_sub = rel_t + j * 0.01
-                        ax, ay, az = ac[j*3], ac[j*3+1], ac[j*3+2]
-                        gx, gy_val, gz = gy[j*3], gy[j*3+1], gy[j*3+2]
-                        imu_samples.append((t_sub, ax, ay, az, gx, gy_val, gz, "right"))
+                        try:
+                            t_sub = t_sec + j * 0.01
+                            ax, ay, az = float(ac[j*3]), float(ac[j*3+1]), float(ac[j*3+2])
+                            gx, gy_val, gz = float(gy[j*3]), float(gy[j*3+1]), float(gy[j*3+2])
+                            raw_imu.append((t_sub, ax, ay, az, gx, gy_val, gz, "right"))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+
+        if not raw_ppg and not raw_imu:
+            return [], []
+
+        # Find global minimum timestamp across all valid records to avoid out-of-order startup skew
+        all_timestamps = [x[0] for x in raw_ppg] + [x[0] for x in raw_imu]
+        min_start_time = min(all_timestamps)
+
+        ppg_samples = [(max(0.0, x[0] - min_start_time), x[1], x[2]) for x in raw_ppg]
+        imu_samples = [(max(0.0, x[0] - min_start_time), x[1], x[2], x[3], x[4], x[5], x[6], x[7]) for x in raw_imu]
 
         # Guarantee strict chronological sorting
         ppg_samples.sort(key=lambda x: x[0])

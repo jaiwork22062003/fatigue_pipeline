@@ -6,6 +6,21 @@ Executes ONLY the Current Production Pipeline (60s Windows, 180s Warmup Lock, Dy
 
 import os
 import sys
+
+# Auto-detect Python runtime with numpy/scipy if launched under bare python3
+try:
+    import numpy
+    import scipy
+except ImportError:
+    candidates = [
+        os.path.expanduser("~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "bin", "python3")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".venv", "Scripts", "python.exe")),
+    ]
+    for c in candidates:
+        if os.path.exists(c) and c != sys.executable:
+            os.execv(c, [c] + sys.argv)
+
 import glob
 import json
 import webbrowser

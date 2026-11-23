@@ -80,11 +80,10 @@ class FatiguePipeline:
         """
         Parses raw JSONL footwear records into strictly sorted time-series streams.
         Separates IMU (100 Hz, dt = 0.01s) and PPG (25 Hz, dt = 0.04s) hardware sampling rates.
+        Uses two-pass global timestamp normalization to ensure immunity to out-of-order initial packets.
         """
-        ppg_samples = []  # (rel_time_sec, ir_val, rd_val)
-        imu_samples = []  # (rel_time_sec, ax, ay, az, gx, gy, gz, foot)
-
-        start_time = None
+        raw_ppg: List[Tuple[float, float, float]] = []
+        raw_imu: List[Tuple[float, float, float, float, float, float, float, str]] = []
 
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for idx, line in enumerate(f):
@@ -100,26 +99,38 @@ class FatiguePipeline:
 
                 topic = record.get("topic", "")
                 content = record.get("content", {})
+                if isinstance(content, str):
+                    try:
+                        content = json.loads(content)
+                    except Exception:
+                        content = {}
+
                 t_type = content.get("T", "")
 
-                # Extract ISO timestamp
-                ts_str = content.get("timestamp")
-                if not ts_str and "Data" in content:
-                    ts_str = content["Data"].get("timestamp")
+                # Extract timestamp (handles ISO string or numeric epoch)
+                ts_val = content.get("timestamp")
+                if not ts_val and "Data" in content and isinstance(content["Data"], dict):
+                    ts_val = content["Data"].get("timestamp")
 
-                if not ts_str:
+                if not ts_val:
                     continue
 
-                try:
-                    dt = datetime.datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    t_sec = dt.timestamp()
-                except Exception:
+                t_sec = None
+                if isinstance(ts_val, (int, float)):
+                    t_sec = float(ts_val) / 1000.0 if ts_val > 1e11 else float(ts_val)
+                elif isinstance(ts_val, str):
+                    try:
+                        dt = datetime.datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+                        t_sec = dt.timestamp()
+                    except Exception:
+                        try:
+                            f_val = float(ts_val)
+                            t_sec = f_val / 1000.0 if f_val > 1e11 else f_val
+                        except Exception:
+                            continue
+
+                if t_sec is None:
                     continue
-
-                if start_time is None:
-                    start_time = t_sec
-
-                rel_t = max(0.0, t_sec - start_time)
 
                 # Parse PPG (Nominal Florina hardware sampling rate = 25 Hz -> dt = 0.04s)
                 if t_type == "PG" or (topic == "PPG" and "IR" in content):
@@ -127,9 +138,14 @@ class FatiguePipeline:
                     rd_arr = content.get("RD", [])
                     n = min(len(ir_arr), len(rd_arr))
                     if n > 0:
-                        ppg_dt = 0.04  # 25 Hz sample interval
+                        ppg_dt = 0.04  # 25 Hz nominal sample interval
                         for j in range(n):
-                            ppg_samples.append((rel_t + j * ppg_dt, float(ir_arr[j]), float(rd_arr[j])))
+                            try:
+                                ir_v = float(ir_arr[j])
+                                rd_v = float(rd_arr[j])
+                                raw_ppg.append((t_sec + j * ppg_dt, ir_v, rd_v))
+                            except (ValueError, TypeError, IndexError):
+                                continue
 
                 # Parse Left Foot IMU (Nominal Florina hardware sampling rate = 100 Hz -> dt = 0.01s)
                 elif t_type == "BL" or (topic == "PPG" and "AC" in content):
@@ -137,28 +153,69 @@ class FatiguePipeline:
                     gy = content.get("GY", [])
                     n_triplets = min(len(ac) // 3, len(gy) // 3)
                     for j in range(n_triplets):
-                        t_sub = rel_t + j * 0.01  # 100 Hz sample interval
-                        ax, ay, az = ac[j*3], ac[j*3+1], ac[j*3+2]
-                        gx, gy_val, gz = gy[j*3], gy[j*3+1], gy[j*3+2]
-                        imu_samples.append((t_sub, ax, ay, az, gx, gy_val, gz, "left"))
+                        try:
+                            t_sub = t_sec + j * 0.01  # 100 Hz sample interval
+                            ax, ay, az = float(ac[j*3]), float(ac[j*3+1]), float(ac[j*3+2])
+                            gx, gy_val, gz = float(gy[j*3]), float(gy[j*3+1]), float(gy[j*3+2])
+                            raw_imu.append((t_sub, ax, ay, az, gx, gy_val, gz, "left"))
+                        except (ValueError, TypeError, IndexError):
+                            continue
 
                 # Parse Right Foot IMU (Nominal Florina hardware sampling rate = 100 Hz -> dt = 0.01s)
                 elif t_type == "BR" or topic == "BPST_RIGHT":
-                    data = content.get("Data", {})
+                    data = content.get("Data", {}) if isinstance(content.get("Data"), dict) else content
                     ac = data.get("AC", [])
                     gy = data.get("GY", [])
                     n_triplets = min(len(ac) // 3, len(gy) // 3)
                     for j in range(n_triplets):
-                        t_sub = rel_t + j * 0.01  # 100 Hz sample interval
-                        ax, ay, az = ac[j*3], ac[j*3+1], ac[j*3+2]
-                        gx, gy_val, gz = gy[j*3], gy[j*3+1], gy[j*3+2]
-                        imu_samples.append((t_sub, ax, ay, az, gx, gy_val, gz, "right"))
+                        try:
+                            t_sub = t_sec + j * 0.01  # 100 Hz sample interval
+                            ax, ay, az = float(ac[j*3]), float(ac[j*3+1]), float(ac[j*3+2])
+                            gx, gy_val, gz = float(gy[j*3]), float(gy[j*3+1]), float(gy[j*3+2])
+                            raw_imu.append((t_sub, ax, ay, az, gx, gy_val, gz, "right"))
+                        except (ValueError, TypeError, IndexError):
+                            continue
+
+        if not raw_ppg and not raw_imu:
+            return [], [], 0.0, 0.0
+
+        all_timestamps = [x[0] for x in raw_ppg] + [x[0] for x in raw_imu]
+        all_timestamps.sort()
+
+        # Identify true session boundaries by ignoring isolated pre-session boot bursts (< 50 records with > 30m silence)
+        clusters: List[List[float]] = []
+        cur_c: List[float] = []
+        for t in all_timestamps:
+            if not cur_c:
+                cur_c.append(t)
+            elif t - cur_c[-1] > 1800.0:  # 30 min gap
+                clusters.append(cur_c)
+                cur_c = [t]
+            else:
+                cur_c.append(t)
+        if cur_c:
+            clusters.append(cur_c)
+
+        sig_clusters = [c for c in clusters if (c[-1] - c[0]) >= 60.0]
+        if sig_clusters:
+            min_start_time = sig_clusters[0][0]
+            max_end_time = sig_clusters[-1][-1]
+        else:
+            min_start_time = all_timestamps[0]
+            max_end_time = all_timestamps[-1]
+
+        # Filter records to the active recording session bounds
+        filtered_ppg = [x for x in raw_ppg if x[0] >= min_start_time and x[0] <= max_end_time + 1.0]
+        filtered_imu = [x for x in raw_imu if x[0] >= min_start_time and x[0] <= max_end_time + 1.0]
+
+        ppg_samples = [(max(0.0, x[0] - min_start_time), x[1], x[2]) for x in filtered_ppg]
+        imu_samples = [(max(0.0, x[0] - min_start_time), x[1], x[2], x[3], x[4], x[5], x[6], x[7]) for x in filtered_imu]
 
         # Guarantee strict chronological monotonic ordering
         ppg_samples.sort(key=lambda x: x[0])
         imu_samples.sort(key=lambda x: x[0])
 
-        return ppg_samples, imu_samples
+        return ppg_samples, imu_samples, min_start_time, max_end_time
 
     def extract_hr_sqi(
         self,
@@ -251,12 +308,18 @@ class FatiguePipeline:
             fallback_invalid["ppg_sqi"] = "unphysiological_ibi"
             return fallback_invalid
 
-        # IBI Coefficient of Variation (Sudden erratic jumps indicate motion noise)
-        ibi_cv = float(np.std(ibi_valid) / np.mean(ibi_valid))
-        hr_ppg = float(np.median(60.0 / ibi_valid))
+        # Filter ectopic/missed-beat outliers (common in insole optics) for robust rhythmic CV
+        med_ibi = float(np.median(ibi_valid))
+        normal_ibi = ibi_valid[np.abs(ibi_valid - med_ibi) <= 0.35 * med_ibi]
+        if len(normal_ibi) >= 3:
+            ibi_cv = float(np.std(normal_ibi) / np.mean(normal_ibi))
+            hr_ppg = float(np.median(60.0 / normal_ibi))
+        else:
+            ibi_cv = float(np.std(ibi_valid) / np.mean(ibi_valid))
+            hr_ppg = float(np.median(60.0 / ibi_valid))
 
         # 6. Motion-Artifact Collision Detection (Walking frequency vs Pulse frequency)
-        # If left foot is vigorously moving (cadence > 40 or RMS > 0.4g) and IBI CV > 0.22,
+        # If left foot is vigorously moving (cadence > 40 or RMS > 0.4g) and IBI CV > 0.20,
         # foot impacts are corrupting the optical pulse signal.
         motion_artifact = False
         if left_foot_cadence >= 40.0 and ibi_cv > 0.20:
@@ -270,7 +333,10 @@ class FatiguePipeline:
             ibi_rd = np.diff(uniform_t[peaks_rd])
             ibi_rd_valid = ibi_rd[(ibi_rd >= 0.28) & (ibi_rd <= 1.50)]
             if len(ibi_rd_valid) >= 3:
-                hr_rd = float(np.median(60.0 / ibi_rd_valid))
+                med_rd = float(np.median(ibi_rd_valid))
+                normal_rd = ibi_rd_valid[np.abs(ibi_rd_valid - med_rd) <= 0.35 * med_rd]
+                ref_rd = normal_rd if len(normal_rd) >= 3 else ibi_rd_valid
+                hr_rd = float(np.median(60.0 / ref_rd))
 
         channel_agreement = True
         if hr_rd and abs(hr_ppg - hr_rd) > 22.0:
@@ -296,13 +362,15 @@ class FatiguePipeline:
         # Note: Compute RMSSD only during high-quality stationary segments (expert review priority)
         rmssd, sdnn = None, None
         hrv_trustworthy = False
-        if left_foot_cadence < 15.0 and ibi_cv < 0.15:
-            rr_ms = ibi_valid * 1000.0
-            raw_rmssd = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2)))
-            if 10.0 <= raw_rmssd <= 120.0:
-                rmssd = round(raw_rmssd, 1)
-                sdnn = round(float(np.std(rr_ms)), 1)
-                hrv_trustworthy = True
+        if left_foot_cadence < 15.0 and ibi_cv < 0.18:
+            ref_intervals = normal_ibi if len(normal_ibi) >= 4 else ibi_valid
+            rr_ms = ref_intervals * 1000.0
+            if len(rr_ms) >= 3:
+                raw_rmssd = float(np.sqrt(np.mean(np.diff(rr_ms) ** 2)))
+                if 10.0 <= raw_rmssd <= 150.0:
+                    rmssd = round(raw_rmssd, 1)
+                    sdnn = round(float(np.std(rr_ms)), 1)
+                    hrv_trustworthy = True
 
         return {
             "median_hr_ppg": round(hr_ppg, 1),
@@ -322,9 +390,9 @@ class FatiguePipeline:
         Activity states: 'stationary', 'walking_steady', 'walking_intermittent', 'running'.
         Calculates true Temporal Gait Asymmetry (ASI %) instead of fragile step count difference.
         """
-        if len(imu_window) < 30:
+        if len(imu_window) < 15:
             return {
-                "activity_state": "stationary",
+                "activity_state": "idle",
                 "steps": 0,
                 "cadence_spm": 0.0,
                 "stride_cv": 0.0,
@@ -361,27 +429,47 @@ class FatiguePipeline:
             acc_mag = np.sqrt(ax**2 + ay**2 + az**2)
             gyro_mag = np.sqrt(gx**2 + gy**2 + gz**2)
 
-            # Plausibility check: gravity must be >= 0.25g. Near-zero indicates sensor sleep/off.
-            mean_acc = float(np.mean(acc_mag))
-            if mean_acc < 0.25:
+            # Plausibility check: only reject if completely flatline zero (disconnected / uninitialized sensor)
+            max_gyro = float(np.max(gyro_mag))
+            max_acc = float(np.max(acc_mag))
+            if max_gyro < 0.02 and max_acc < 0.02:
                 return False, 0, [], 0.0, 0.0
 
             rms = float(np.sqrt(np.mean(acc_mag**2)))
             peak_imp = float(np.max(acc_mag))
 
-            # Step detection on single foot (minimum single-foot step period ~0.45s)
-            detrended_gyro = gyro_mag - np.mean(gyro_mag)
+            # Step detection on single foot (minimum single-foot step period ~0.38s)
             diffs = np.diff(times)
             valid_diffs = diffs[diffs > 0]
             dt = float(np.median(valid_diffs)) if len(valid_diffs) > 0 else 0.01
             fs = 1.0 / dt if dt > 0 else 100.0
+            min_dist = max(5, int(fs * 0.38))
 
-            min_dist = max(5, int(fs * 0.45))
-            prominence = max(0.20, float(np.std(detrended_gyro) * 0.5))
-            peaks, _ = signal.find_peaks(detrended_gyro, distance=min_dist, prominence=prominence)
+            # Multi-modal peak detection: Gyroscope angular swing + Accelerometer heel-strike impact
+            detrended_gyro = gyro_mag - np.mean(gyro_mag)
+            prom_g = max(0.20, float(np.std(detrended_gyro) * 0.35))
+            peaks_g, _ = signal.find_peaks(detrended_gyro, distance=min_dist, prominence=prom_g)
+
+            detrended_acc = acc_mag - np.mean(acc_mag)
+            prom_a = max(0.12, float(np.std(detrended_acc) * 0.35))
+            peaks_a, _ = signal.find_peaks(detrended_acc, distance=min_dist, prominence=prom_a)
+
+            # Select most representative peaks: gyro angular swing is primary, acc heel-strike is fallback
+            if len(peaks_g) >= 2:
+                peaks = peaks_g
+            elif len(peaks_a) >= 2:
+                peaks = peaks_a
+            elif len(peaks_g) > 0:
+                peaks = peaks_g
+            elif len(peaks_a) > 0:
+                peaks = peaks_a
+            else:
+                peaks = []
+
             step_times = list(times[peaks]) if len(peaks) > 0 else []
+            is_active = (len(peaks) > 0) or (rms > 0.08 and max_gyro > 5.0)
 
-            return True, len(peaks), step_times, rms, peak_imp
+            return is_active, len(peaks), step_times, rms, peak_imp
 
         l_active, l_steps, l_times, l_rms, l_peak = analyze_foot_stream(left_samples)
         r_active, r_steps, r_times, r_rms, r_peak = analyze_foot_stream(right_samples)
@@ -414,14 +502,16 @@ class FatiguePipeline:
         cadence_spm = min(180.0, (total_steps / duration) * 60.0)
 
         # Activity-State Classification
-        if cadence_spm < 10.0 and rms_acc < 0.35:
+        if total_steps == 0 and rms_acc < 0.20:
             activity_state = "stationary"
         elif cadence_spm >= 130.0 and rms_acc > 1.8:
             activity_state = "running"
         elif cadence_spm >= 55.0:
             activity_state = "walking_steady"
-        else:
+        elif cadence_spm > 0:
             activity_state = "walking_intermittent"
+        else:
+            activity_state = "stationary"
 
         # Stride Time Variability (CV) on verified walking states only
         if len(active_stride_times) >= 4 and activity_state in ["walking_steady", "running"]:
@@ -435,7 +525,7 @@ class FatiguePipeline:
         # Temporal Gait Asymmetry Index (ASI %): Compares Left vs Right Step Duration
         # ASI = 100 * |T_L - T_R| / ((T_L + T_R) / 2)
         temporal_asi = 0.0
-        if l_active and r_active and len(l_times) >= 3 and len(r_times) >= 3 and activity_state == "walking_steady":
+        if l_active and r_active and len(l_times) >= 3 and len(r_times) >= 3 and activity_state in ["walking_steady", "walking_intermittent"]:
             t_left_mean = float(np.mean(np.diff(l_times)))
             t_right_mean = float(np.mean(np.diff(r_times)))
             mean_both = (t_left_mean + t_right_mean) / 2.0
@@ -512,8 +602,10 @@ class FatiguePipeline:
                 cardiac_cost_raw = round(delta_hr / max(10.0, current_cadence), 3)
                 # 0.20 ratio is normal/fresh; 0.70 indicates heavy cardio strain
                 cardiac_cost_score = max(0.0, min(100.0, (cardiac_cost_raw - 0.20) / 0.50 * 100.0))
+                cardio_strain = 0.60 * pct_hrr + 0.40 * cardiac_cost_score
+            else:
+                cardio_strain = pct_hrr
 
-            cardio_strain = 0.60 * pct_hrr + 0.40 * cardiac_cost_score
             self.last_active_hr = current_hr
         else:
             cardio_strain = 0.0
@@ -528,7 +620,7 @@ class FatiguePipeline:
 
         # 3. Gait Deterioration (0 - 100)
         if self.baseline_stride_cv and self.baseline_stride_cv > 0 and act_state in ["walking_steady", "running"]:
-            cv_increase = max(0.0, (current_stride_cv - self.baseline_stride_cv) / (self.baseline_stride_cv + 0.02) * 50.0)
+            cv_increase = max(0.0, min(100.0, (current_stride_cv - self.baseline_stride_cv) / (self.baseline_stride_cv + 0.02) * 50.0))
         else:
             cv_increase = 0.0
 
@@ -571,7 +663,15 @@ class FatiguePipeline:
 
             # Cumulative Exposure Drift (Bounded at +15.0 points)
             cum_drift = min(15.0, self.cum_load * 0.012)
-            composite = min(95.0, max(0.0, active_composite + cum_drift))
+            instantaneous_composite = min(95.0, max(0.0, active_composite + cum_drift))
+
+            # Physiological Fatigue Inertia & Continuity: A worker on their feet cannot drop 100% of their fatigue in 60s
+            if self.last_fatigue_score > 0 and instantaneous_composite < self.last_fatigue_score:
+                decay = 0.96 if act_state == "walking_intermittent" else 0.985
+                composite = max(instantaneous_composite, self.last_fatigue_score * decay)
+            else:
+                composite = instantaneous_composite
+
             self.last_fatigue_score = composite
 
         else:
@@ -643,7 +743,7 @@ class FatiguePipeline:
         Features Event-Driven Baseline establishment and continuous motion tracking.
         """
         print(f"[*] Ingesting raw sensor records from {file_path}...")
-        ppg_samples, imu_samples = self.parse_records(file_path, max_lines=max_lines)
+        ppg_samples, imu_samples, session_start_epoch, session_end_epoch = self.parse_records(file_path, max_lines=max_lines)
 
         print(f"[+] Loaded {len(ppg_samples)} PPG samples and {len(imu_samples)} IMU triplets.")
 
@@ -666,6 +766,8 @@ class FatiguePipeline:
         for w in range(total_windows):
             w_start = w * self.window_sec
             w_end = (w + 1) * self.window_sec
+            win_epoch = session_start_epoch + w_start if session_start_epoch > 0 else 0
+            clock_str = datetime.datetime.fromtimestamp(win_epoch).strftime("%H:%M:%S") if session_start_epoch > 0 else ""
 
             # Slice window PPG (chronologically ordered)
             w_ppg = []
@@ -736,6 +838,7 @@ class FatiguePipeline:
             res = {
                 "window": w + 1,
                 "time_sec": round(w_end, 1),
+                "clock_time": clock_str,
                 "is_warmup": is_warmup,
                 "activity_state": fatigue.get("activity_state", gait.get("activity_state", "stationary")),
                 "worker_state": fatigue.get("activity_state", gait.get("activity_state", "stationary")),
@@ -772,8 +875,17 @@ class FatiguePipeline:
         else:
             overall_severity = "critical"
 
+        start_dt = datetime.datetime.fromtimestamp(session_start_epoch) if session_start_epoch > 0 else None
+        end_dt = datetime.datetime.fromtimestamp(session_end_epoch) if session_end_epoch > 0 else None
+        active_cads = [w["cadence_spm"] for w in window_results if w.get("cadence_spm") and w["cadence_spm"] > 0]
+        active_hrs = [w["hr_bpm"] for w in window_results if w.get("hr_bpm") and w.get("hr_trustworthy")]
+
         return {
             "app": self.app,
+            "session_start_iso": start_dt.isoformat() if start_dt else None,
+            "session_end_iso": end_dt.isoformat() if end_dt else None,
+            "session_start_clock": start_dt.strftime("%H:%M:%S") if start_dt else None,
+            "session_end_clock": end_dt.strftime("%H:%M:%S") if end_dt else None,
             "resting_hr_baseline": self.baseline_resting_hr,
             "walking_cadence_baseline": self.baseline_cadence,
             "total_windows": total_windows,
@@ -786,7 +898,12 @@ class FatiguePipeline:
                 "final_fatigue": round(final_fatigue, 2),
                 "severity": overall_severity,
                 "walking_windows": sum(1 for w in window_results if "walking" in w.get("activity_state", "")),
-                "stationary_windows": sum(1 for w in window_results if w.get("activity_state") == "stationary")
+                "stationary_windows": sum(1 for w in window_results if w.get("activity_state") == "stationary"),
+                "idle_windows": sum(1 for w in window_results if w.get("activity_state") in ["idle", "disconnected"]),
+                "active_cadence_avg": round(float(np.mean(active_cads)), 1) if active_cads else 0.0,
+                "active_hr_avg": round(float(np.mean(active_hrs)), 1) if active_hrs else None,
+                "peak_cadence": round(float(max(active_cads)), 1) if active_cads else 0.0,
+                "peak_hr": round(float(max(active_hrs)), 1) if active_hrs else None
             },
             "windows": window_results
         }
